@@ -1,0 +1,5 @@
+node_modules/
+wtp.db
+.env
+*.log
+.DS_Store
