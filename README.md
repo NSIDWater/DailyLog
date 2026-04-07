@@ -1,0 +1,2 @@
+# DailyLog
+DailyLog
