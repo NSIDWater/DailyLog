@@ -183,11 +183,11 @@ table.log-table input.synced{background:#e8f5e9;color:var(--success)}
     <button class="btn-print" onclick="printReport()">&#128438; Export</button>
   </div>
   <div class="tabs">
+    <button class="tab" onclick="showPage('raw',this)">Raw Water</button>
     <button class="tab active" onclick="showPage('shift',this)">Shift Log</button>
     <button class="tab" onclick="showPage('clearwell-tab',this)">Clearwell</button>
-    <button class="tab" onclick="showPage('finished',this)">Overview</button>
-    <button class="tab" onclick="showPage('raw',this)">Raw Water</button>
     <button class="tab" onclick="showPage('altvalve',this)">Alt Valve</button>
+    <button class="tab" onclick="showPage('finished',this)">Overview</button>
   </div>
 </div>
 
@@ -202,10 +202,7 @@ table.log-table input.synced{background:#e8f5e9;color:var(--success)}
         <button class="shift-btn" onclick="selectShift(this,'8am')">8:00 AM Shift</button>
         <button class="shift-btn" onclick="selectShift(this,'4pm')">4:00 PM Shift</button>
       </div>
-      <div class="grid2">
-        <div class="field"><label>Operator Name</label><input type="text" id="operator-name" placeholder="Enter operator name" oninput="autosave()"></div>
-        <div class="field"><label>Shift Start Time</label><input type="text" id="shift-time-display" readonly style="background:#f5f8fb"></div>
-      </div>
+      <div id="shift-info-container"></div>
     </div>
   </div>
 
@@ -435,6 +432,9 @@ let currentShift='12am';
 let currentFWShift='12am';
 let cwSnapshots={};
 let tankSnapshots={};
+let opSnapshots={};
+let lastChlorine='';
+let lastAmmonia='';
 let rawEntries=[];
 let adjData=[];
 let avData=[];
@@ -487,6 +487,7 @@ function showSaved(){
 function autosave(){
   try{
     // Snapshot current shift CW readings and tank levels
+    opSnapshots[currentShift]=v('opname-'+currentShift);
     cwSnapshots[currentShift]={};SCW_FIELDS.forEach(f=>cwSnapshots[currentShift][f.id]=v(scwId(currentShift,f.id)));
     tankSnapshots[currentShift]={g1:v('tank-'+currentShift+'-g1'),g2:v('tank-'+currentShift+'-g2'),b1:v('tank-'+currentShift+'-b1'),b2:v('tank-'+currentShift+'-b2')};
     localStorage.setItem(todayKey(),JSON.stringify(snap()));showSaved();
@@ -497,7 +498,10 @@ function snap(){
   // First snapshot current shift before saving
   cwSnapshots[currentShift]={};SCW_FIELDS.forEach(f=>cwSnapshots[currentShift][f.id]=v(scwId(currentShift,f.id)));
   tankSnapshots[currentShift]={g1:v('tank-'+currentShift+'-g1'),g2:v('tank-'+currentShift+'-g2'),b1:v('tank-'+currentShift+'-b1'),b2:v('tank-'+currentShift+'-b2')};
-  const d={shift:currentShift,op:v('operator-name'),tanks:{}};
+  opSnapshots[currentShift]=v('opname-'+currentShift);
+  const d={shift:currentShift,op:opSnapshots[currentShift]||'',tanks:{}};
+  d.allOps={};FWSHIFTS.forEach(s=>d.allOps[s]=opSnapshots[s]||'');
+  d.lastChlorine=lastChlorine;d.lastAmmonia=lastAmmonia;
   // Save all shifts' tanks and scw
   d.allTanks={};FWSHIFTS.forEach(s=>d.allTanks[s]={g1:v('tank-'+s+'-g1'),g2:v('tank-'+s+'-g2'),b1:v('tank-'+s+'-b1'),b2:v('tank-'+s+'-b2')});
   d.allScw={};FWSHIFTS.forEach(s=>{d.allScw[s]={};SCW_FIELDS.forEach(f=>d.allScw[s][f.id]=v(scwId(s,f.id)));});
@@ -519,7 +523,9 @@ function load(){
   try{
     const raw=localStorage.getItem(todayKey());if(!raw)return;
     const d=JSON.parse(raw);
-    sv('operator-name',d.op);
+    if(d.allOps){FWSHIFTS.forEach(s=>{sv('opname-'+s,d.allOps[s]||'');opSnapshots[s]=d.allOps[s]||'';});}else if(d.op){sv('opname-'+currentShift,d.op);opSnapshots[currentShift]=d.op;}
+    if(d.lastChlorine!==undefined)lastChlorine=d.lastChlorine;
+    if(d.lastAmmonia!==undefined)lastAmmonia=d.lastAmmonia;
     if(d.shift){currentShift=d.shift;setShiftBtns(currentShift);updateShiftTime(currentShift);showSFW(currentShift);showShiftPanels(currentShift);}
     if(d.allTanks){FWSHIFTS.forEach(s=>{if(!d.allTanks[s])return;const t=d.allTanks[s];sv('tank-'+s+'-g1',t.g1);sv('tank-'+s+'-g2',t.g2);sv('tank-'+s+'-b1',t.b1);sv('tank-'+s+'-b2',t.b2);});}
     else if(d.tanks){sv('tank-'+currentShift+'-g1',d.tanks.g1);sv('tank-'+currentShift+'-g2',d.tanks.g2);sv('tank-'+currentShift+'-b1',d.tanks.b1);sv('tank-'+currentShift+'-b2',d.tanks.b2);}
@@ -590,18 +596,28 @@ function checkEvenInline(inp){
 // ─── Clearwell → Pump table sync ─────────────────────────────────────────────
 // Clearwell col order: pH(0) PAlk(1) MAlk(2) TotH(3) CaH(4) Color(5) NTU(6) FreeCl2(7) TotCl2(8)
 // Pump col order: Flow(0) pH(1) FreeCl2(2) TotCl2(3) CO2(4) Scale(5) NaOH(6) Ortho(7) Ammonia(8) Hypo(9)
+// Map each shift to its pump table row index (row = PUMPTIMES index)
+const SHIFT_PUMP_ROW={'12am':0,'8am':4,'4pm':8};
+
 function syncSCWtoPump(){
-  // Sync current shift's start-of-shift clearwell pH and Cl2 into 12:00 AM pump row
-  const pr=document.querySelectorAll('#pump-tbody tr')[0];
-  if(!pr)return;
-  const pi=pr.querySelectorAll('input');
+  // Sync ALL shifts' start-of-shift clearwell pH + Free/Total Cl2 to their
+  // matching time rows in the pump table:
+  //   12:00 AM shift → row 0  (12:00 AM)
+  //    8:00 AM shift → row 4  ( 8:00 AM)
+  //    4:00 PM shift → row 8  ( 4:00 PM)
   function fill(dst,srcId){
     const src=document.getElementById(srcId);
     if(dst&&src){dst.value=src.value;dst.classList.toggle('synced',src.value!=='');}
   }
-  fill(pi[1],scwId(currentShift,'scw-ph'));
-  fill(pi[2],scwId(currentShift,'scw-fcl2'));
-  fill(pi[3],scwId(currentShift,'scw-tcl2'));
+  FWSHIFTS.forEach(function(shift){
+    const rowIdx=SHIFT_PUMP_ROW[shift];
+    const row=document.querySelectorAll('#pump-tbody tr')[rowIdx];
+    if(!row)return;
+    const pi=row.querySelectorAll('input');
+    fill(pi[1],scwId(shift,'scw-ph'));
+    fill(pi[2],scwId(shift,'scw-fcl2'));
+    fill(pi[3],scwId(shift,'scw-tcl2'));
+  });
 }
 
 // ─── Finished water: shift log → FW tab sync ─────────────────────────────────
@@ -610,6 +626,33 @@ function sfwChange(shift,fid,inp){
   if(fid==='thard'||fid==='cahard')calcFWMg(shift);
   calcLI();updateFWOverview();
   autosave();
+}
+
+// ─── Build: Per-shift operator name panels ───────────────────────────────────
+function buildShiftInfoPanels(){
+  const c=document.getElementById('shift-info-container');if(!c)return;
+  const map={'12am':'12:00 AM','8am':'8:00 AM','4pm':'4:00 PM'};
+  FWSHIFTS.forEach(function(shift){
+    const wrap=document.createElement('div');
+    wrap.id='info-wrap-'+shift;
+    wrap.style.display=shift==='12am'?'block':'none';
+    const grid=document.createElement('div');grid.className='grid2';
+    const f1=document.createElement('div');f1.className='field';
+    const l1=document.createElement('label');l1.textContent='Operator Name';
+    const i1=document.createElement('input');
+    i1.type='text';i1.id='opname-'+shift;i1.placeholder='Enter operator name';
+    i1.setAttribute('data-shift',shift);
+    i1.addEventListener('input',function(){opSnapshots[this.dataset.shift]=this.value;autosave();});
+    f1.appendChild(l1);f1.appendChild(i1);
+    const f2=document.createElement('div');f2.className='field';
+    const l2=document.createElement('label');l2.textContent='Shift Start Time';
+    const i2=document.createElement('input');
+    i2.type='text';i2.id='shift-time-'+shift;i2.readOnly=true;i2.style.background='#f5f8fb';
+    i2.value=map[shift];
+    f2.appendChild(l2);f2.appendChild(i2);
+    grid.appendChild(f1);grid.appendChild(f2);
+    wrap.appendChild(grid);c.appendChild(wrap);
+  });
 }
 
 // ─── Build: Per-shift tank level panels ──────────────────────────────────────
@@ -853,20 +896,37 @@ function adjNowTimeStr(){
   return h12+':00 '+ampm;
 }
 
+function adjAutofillPrev(chemSel){
+  const tr=chemSel.closest('tr');if(!tr)return;
+  const ins=tr.querySelectorAll('input[type="number"]');
+  const prevInp=ins[0];if(!prevInp)return;
+  const chem=chemSel.value;
+  if(chem==='Chlorine'&&lastChlorine!=='')prevInp.value=lastChlorine;
+  else if(chem==='Ammonia'&&lastAmmonia!=='')prevInp.value=lastAmmonia;
+  saveAdj();
+}
+function adjTrackNew(newInp){
+  const tr=newInp.closest('tr');if(!tr)return;
+  const sels=tr.querySelectorAll('select');
+  const chem=sels[1]?sels[1].value:'';
+  if(chem==='Chlorine')lastChlorine=newInp.value;
+  else if(chem==='Ammonia')lastAmmonia=newInp.value;
+  saveAdj();
+}
 function addAdjRow(silent){
   const tb=document.getElementById('adj-tbody');if(!tb)return;
   const tr=document.createElement('tr');
   const current=silent?'':adjNowTimeStr();
   const slots=['12:00 AM','2:00 AM','4:00 AM','6:00 AM','8:00 AM','10:00 AM','12:00 PM','2:00 PM','4:00 PM','6:00 PM','8:00 PM','10:00 PM'];
-  const timeOpts=`<option value="">-- Select --</option>`+slots.map(t=>`<option${t===current?' selected':''}>${t}</option>`).join('');
-  tr.innerHTML=`
-    <td><select oninput="saveAdj()" style="font-family:'Courier New',monospace;font-size:11px;border:none;background:transparent;color:var(--blue);width:90px">${timeOpts}</select></td>
-    <td><select oninput="saveAdj()" style="font-family:'Courier New',monospace;font-size:11px;border:none;background:transparent;color:var(--blue);width:90px">
-      <option value="">Select</option><option>Chlorine</option><option>Ammonia</option>
-    </select></td>
-    <td style="white-space:nowrap"><input type="number" step="0.01" placeholder="0.00" style="width:60px" oninput="saveAdj()"> mg/L</td>
-    <td style="white-space:nowrap"><input type="number" step="0.01" placeholder="0.00" style="width:60px" oninput="saveAdj()"> mg/L</td>
-    <td style="text-align:center"><button onclick="deleteAdjRow(this)" style="background:none;border:none;cursor:pointer;color:#b91c1c;font-size:14px;padding:2px 6px" title="Delete entry">&#10005;</button></td>`;
+  const timeOpts='<option value="">-- Select --</option>'+slots.map(t=>'<option'+(t===current?' selected':'')+'>'+t+'</option>').join('');
+  tr.innerHTML=
+    '<td><select oninput="saveAdj()" style="font-family:monospace;font-size:11px;border:none;background:transparent;color:#1a3a5c;width:90px">'+timeOpts+'</select></td>'+
+    '<td><select oninput="adjAutofillPrev(this)" style="font-family:monospace;font-size:11px;border:none;background:transparent;color:#1a3a5c;width:90px">'+
+      '<option value="">Select</option><option>Chlorine</option><option>Ammonia</option>'+
+    '</select></td>'+
+    '<td style="white-space:nowrap"><input type="number" step="0.01" placeholder="0.00" style="width:60px" oninput="saveAdj()"> mg/L</td>'+
+    '<td style="white-space:nowrap"><input type="number" step="0.01" placeholder="0.00" style="width:60px" oninput="adjTrackNew(this)"> mg/L</td>'+
+    '<td style="text-align:center"><button onclick="deleteAdjRow(this)" style="background:none;border:none;cursor:pointer;color:#b91c1c;font-size:14px;padding:2px 6px" title="Delete">&#10005;</button></td>';
   tb.appendChild(tr);
   if(!silent)saveAdj();
 }
@@ -882,8 +942,10 @@ function saveAdj(){
   adjData=[];
   rows.forEach(tr=>{
     const ins=tr.querySelectorAll('input,select,textarea');
-    adjData.push({time:ins[0]?.value||'',chem:ins[1]?.value||'',prev:ins[2]?.value||'',
-      next:ins[3]?.value||''});
+    const entry={time:ins[0]?.value||'',chem:ins[1]?.value||'',prev:ins[2]?.value||'',next:ins[3]?.value||''};
+    adjData.push(entry);
+    if(entry.chem==='Chlorine'&&entry.next)lastChlorine=entry.next;
+    if(entry.chem==='Ammonia'&&entry.next)lastAmmonia=entry.next;
   });
   autosave();
 }
@@ -948,13 +1010,18 @@ function selectShift(btn,shift){
 }
 function showShiftPanels(shift){
   FWSHIFTS.forEach(s=>{
+    const iw=document.getElementById('info-wrap-'+s);
     const tw=document.getElementById('tank-wrap-'+s);
     const cw=document.getElementById('scw-wrap-'+s);
+    if(iw)iw.style.display=s===shift?'block':'none';
     if(tw)tw.style.display=s===shift?'block':'none';
     if(cw)cw.style.display=s===shift?'block':'none';
   });
 }
-function updateShiftTime(shift){sv('shift-time-display',{'12am':'12:00 AM','8am':'8:00 AM','4pm':'4:00 PM'}[shift]);}
+function updateShiftTime(shift){
+  const map={'12am':'12:00 AM','8am':'8:00 AM','4pm':'4:00 PM'};
+  FWSHIFTS.forEach(s=>sv('shift-time-'+s,map[s]));
+}
 function showSFW(shift){FWSHIFTS.forEach(s=>{const e=document.getElementById('sfw-wrap-'+s);if(e)e.style.display=s===shift?'block':'none';});}
 // selectFWShift removed — overview uses 3-column layout
 function showPage(name,btn){
@@ -983,7 +1050,7 @@ function renderRawHistory(){
 // ─── Print / Export ───────────────────────────────────────────────────────────
 function printReport(){
   const dateStr=fmtDate(new Date());
-  const opName=v('operator-name')||'N/A';
+  const opName=opSnapshots[currentShift]||v('opname-'+currentShift)||'N/A';
   function row(lbl,val){return `<tr><td style="padding:4px 8px;font-size:11px;color:#5a7a96;font-weight:700;white-space:nowrap;border:1px solid #bbc8d4">${lbl}</td><td style="padding:4px 8px;font-size:12px;font-weight:700;border:1px solid #bbc8d4">${val||'—'}</td></tr>`;}
   function th(cols){return `<tr>${cols.map(c=>`<th style="background:#1a3a5c;color:white;padding:5px 6px;font-size:9px;text-transform:uppercase;letter-spacing:0.4px;text-align:center;white-space:nowrap">${c}</th>`).join('')}</tr>`;}
 
@@ -1203,10 +1270,11 @@ function updateAVSummary(){
 window.addEventListener('DOMContentLoaded',()=>{
   document.getElementById('current-date').textContent=fmtDate(new Date());
   const rd=document.getElementById('raw-date');if(rd)rd.value=new Date().toISOString().split('T')[0];
+  buildShiftInfoPanels();
   buildTankPanels();
   buildSCW();
   // Wire pH field to also sync to pump table
-  document.addEventListener('input',function(e){if(e.target&&e.target.id.startsWith('scw-')&&e.target.id.endsWith('-ph'))syncSCWtoPump();});
+  document.addEventListener('input',function(e){const id=e.target&&e.target.id||'';if(id.startsWith('scw-')&&(id.endsWith('-ph')||id.endsWith('-fcl2')||id.endsWith('-tcl2')))syncSCWtoPump();});
   buildSFW();
   buildPump();
   buildFWTab();
